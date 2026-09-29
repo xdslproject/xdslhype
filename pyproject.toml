@@ -7,7 +7,7 @@ name = "xdslhype"
 description = "An xDSL project for creating transformation passes for ExaHyPE."
 readme = "README.md"
 license = { text = "Apache License v2.0 with LLVM Exceptions" }
-authors = ["Timothy Stokes"]
+authors = []
 requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
