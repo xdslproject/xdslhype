@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -14,6 +15,8 @@ from xdsl.pattern_rewriter import (
 )
 from xdsl.traits import IsTerminator
 from xdsl.utils.exceptions import PassFailedException
+
+from .omp_task_dependences import DependenceInfo
 
 
 def _is_nested_in_parallel_construct(op: Operation) -> bool:
@@ -131,7 +134,7 @@ def _take_body(loop: scf.ParallelOp, rewriter: PatternRewriter) -> Block:
 
 
 def _replace_with_construct(
-    loop: scf.ParallelOp, construct: Operation, rewriter: PatternRewriter
+    loop: scf.ParallelOp, construct: Sequence[Operation], rewriter: PatternRewriter
 ) -> None:
     """
     Replace `loop` with `construct`, wrapped in `omp.parallel { omp.single { } }`
@@ -142,7 +145,7 @@ def _replace_with_construct(
         return
 
     parallel, single = _empty_parallel_region()
-    single.region.block.add_ops([construct, omp.TerminatorOp()])
+    single.region.block.add_ops([*construct, omp.TerminatorOp()])
     rewriter.replace(loop, parallel)
 
 
@@ -211,7 +214,7 @@ class ConvertParallelToTaskloop(RewritePattern):
             operands=[[], [], [], grainsize, [], [], num_tasks, [], [], []],
             regions=[Region(Block([loop_nest]))],
         )
-        _replace_with_construct(loop, taskloop, rewriter)
+        _replace_with_construct(loop, [taskloop], rewriter)
 
 
 @dataclass
@@ -246,9 +249,27 @@ class ConvertParallelToTasks(RewritePattern):
 
     A loop that is already inside an `omp.single` region (see the pass's
     `single_region` option) becomes just the `omp.taskgroup`.
+
+    With dependence information (the pass's `depend` option) the taskgroup is
+    omitted for loops whose accesses could be analysed. Instead each task gets
+    `depend` clauses on the memrefs written by tasks of any loop:
+
+    - For memrefs only accessed as `M[%i0, ...]`, where `%i0` is the outermost
+    induction variable of a loop over `[0, ub)` with step 1, a task depends on
+    its own patch(es) only, through the token `aligned_pointer(M) + %p`:
+    `in` if the loop only reads M, `inout` if it writes it.
+    - For any other such memref, tasks depend on the whole buffer, through the
+    token `aligned_pointer(M)`: `in` if the loop only reads it, `inoutset` if
+    it writes it, so that the loop's own tasks do not serialise. An empty
+    separator task with `depend(inout)` is created before the loop's tasks so
+    that they also wait for the tasks of the previous loop writing M.
+
+    Tokens only identify dependences; they lie within M's allocation so tokens
+    of different buffers never collide.
     """
 
     chunk: int
+    dependences: DependenceInfo | None = None
 
     @op_type_rewrite_pattern
     def match_and_rewrite(self, loop: scf.ParallelOp, rewriter: PatternRewriter, /):
@@ -309,25 +330,125 @@ class ConvertParallelToTasks(RewritePattern):
             innermost.add_op(scf.YieldOp())
         task_block.add_op(omp.TerminatorOp())
 
+        accesses = (
+            None if self.dependences is None else self.dependences.loops.get(loop)
+        )
+        if accesses is None or accesses.opaque:
+            task = omp.TaskOp(
+                operands=[[], [], [], [], [], [], [], [], []],
+                regions=[Region(task_block)],
+            )
+            task_start_block.add_ops([task, scf.YieldOp()])
+            taskgroup = omp.TaskgroupOp(
+                operands=[[], [], []],
+                regions=[
+                    Region(
+                        Block(
+                            [
+                                scf.ForOp(lb0, ub0, task_step, [], task_start_block),
+                                omp.TerminatorOp(),
+                            ]
+                        )
+                    )
+                ],
+            )
+            _replace_with_construct(loop, [taskgroup], rewriter)
+            return
+
+        assert self.dependences is not None
+        construct: list[Operation] = []
+        depend_vars: list[SSAValue] = []
+        depend_kinds: list[omp.DependKindAttr] = []
+        for target in accesses.accessed():
+            if target not in self.dependences.task_written:
+                continue
+            written = target in accesses.writes
+            with ImplicitBuilder(rewriter):
+                base = memref.ExtractAlignedPointerAsIndexOp.get(target)
+            if target in self.dependences.per_patch:
+                with ImplicitBuilder(task_start_block):
+                    token = _token(arith.AddiOp(base, task_start).result)
+                kind = omp.DependKind.TASKDEPENDINOUT
+            else:
+                with ImplicitBuilder(rewriter):
+                    token = _token(base.aligned_pointer)
+                kind = omp.DependKind.TASKDEPENDINOUTSET
+                if written:
+                    construct.append(_separator_task(token))
+            if not written:
+                kind = omp.DependKind.TASKDEPENDIN
+            depend_vars.append(token)
+            depend_kinds.append(omp.DependKindAttr(kind))
+
         task = omp.TaskOp(
-            operands=[[], [], [], [], [], [], [], [], []],
+            operands=[[], [], depend_vars, [], [], [], [], [], []],
+            properties=(
+                {"depend_kinds": builtin.ArrayAttr(depend_kinds)}
+                if depend_kinds
+                else {}
+            ),
             regions=[Region(task_block)],
         )
         task_start_block.add_ops([task, scf.YieldOp()])
-        taskgroup = omp.TaskgroupOp(
-            operands=[[], [], []],
-            regions=[
-                Region(
-                    Block(
-                        [
-                            scf.ForOp(lb0, ub0, task_step, [], task_start_block),
-                            omp.TerminatorOp(),
-                        ]
-                    )
-                )
-            ],
-        )
-        _replace_with_construct(loop, taskgroup, rewriter)
+        construct.append(scf.ForOp(lb0, ub0, task_step, [], task_start_block))
+        _replace_with_construct(loop, construct, rewriter)
+
+
+def _token(address: SSAValue) -> SSAValue:
+    """An `!llvm.ptr` dependence token for an index-typed address."""
+    return llvm.IntToPtrOp(arith.IndexCastOp(address, builtin.i64)).results[0]
+
+
+def _separator_task(token: SSAValue) -> omp.TaskOp:
+    """An empty task ordering later `inoutset` tasks after earlier ones."""
+    return omp.TaskOp(
+        operands=[[], [], [token], [], [], [], [], [], []],
+        properties={
+            "depend_kinds": builtin.ArrayAttr(
+                [omp.DependKindAttr(omp.DependKind.TASKDEPENDINOUT)]
+            )
+        },
+        regions=[Region(Block([omp.TerminatorOp()]))],
+    )
+
+
+def _insert_taskwaits(
+    block: Block, dependences: DependenceInfo, outstanding: bool
+) -> bool:
+    """
+    Insert `omp.taskwait` in code run by the thread creating the tasks wherever
+    it may touch memory used by tasks still in flight, and before the tasks of
+    loops that could not be analysed.
+
+    `outstanding` tells whether tasks may be in flight on entry to the block;
+    the same is returned for its exit.
+    """
+    for op in list(block.ops):
+        if isinstance(op, scf.ParallelOp) and op in dependences.loops:
+            if dependences.loops[op].opaque:
+                if outstanding:
+                    block.insert_op_before(omp.TaskwaitOp(operands=[[]]), op)
+                # Its tasks are waited for by a taskgroup.
+                outstanding = False
+            else:
+                outstanding = True
+        elif any(
+            isinstance(inner, scf.ParallelOp) and inner in dependences.loops
+            for inner in op.walk()
+        ):
+            # A loop may run its body more than once: tasks of an earlier
+            # iteration may be in flight on entry.
+            entry = outstanding or not isinstance(op, scf.IfOp)
+            exits = [
+                _insert_taskwaits(inner, dependences, entry)
+                for region in op.regions
+                for inner in region.blocks
+            ]
+            outstanding = outstanding or any(exits)
+        elif outstanding and dependences.needs_wait(op):
+            block.insert_op_before(omp.TaskwaitOp(operands=[[]]), op)
+            outstanding = False
+    return outstanding
 
 
 @dataclass(frozen=True)
@@ -352,6 +473,14 @@ class ConvertScfToOmpTasks(ModulePass):
     chooses how to divide iterations.
     - chunk: int: (task mode) iterations of the outermost dimension per task,
     default 1.
+    - depend: bool: (task mode) instead of waiting for all tasks of a loop
+    before continuing, give each task `depend` clauses on the memrefs it reads
+    and writes, so tasks of different loops can overlap (see
+    `omp_task_dependences` for the analysis and its assumptions). Loops whose
+    accesses cannot be analysed keep their taskgroup and are preceded by a
+    `omp.taskwait`, as is any other code touching memory in use by tasks. Only
+    useful with single_region: otherwise every loop still ends its own parallel
+    region, which waits for its tasks.
     - single_region: bool: instead of one parallel region per loop, create a
     single `omp.parallel { omp.single { ... } }` per function, spanning from the
     first to the last op that contains a converted loop, so the thread team is
@@ -369,6 +498,7 @@ class ConvertScfToOmpTasks(ModulePass):
     num_tasks: int | None = None
     chunk: int | None = None
     single_region: bool = False
+    depend: bool = False
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
         for value, option in (
@@ -387,6 +517,8 @@ class ConvertScfToOmpTasks(ModulePass):
                 )
             if self.chunk is not None:
                 raise PassFailedException("chunk is only supported in task mode")
+            if self.depend:
+                raise PassFailedException("depend is only supported in task mode")
             pattern = ConvertParallelToTaskloop(self.grainsize, self.num_tasks)
         elif self.mode == "task":
             if self.grainsize is not None or self.num_tasks is not None:
@@ -404,5 +536,22 @@ class ConvertScfToOmpTasks(ModulePass):
             for func_op in funcs:
                 for block in func_op.body.blocks:
                     _wrap_in_single_region(block)
+
+        if isinstance(pattern, ConvertParallelToTasks) and self.depend:
+            funcs = [f for f in op.walk() if isinstance(f, func.FuncOp)]
+            for func_op in funcs:
+                dependences = DependenceInfo.build(
+                    loop
+                    for loop in func_op.walk()
+                    if isinstance(loop, scf.ParallelOp) and _is_convertible(loop)
+                )
+                singles = [s for s in func_op.walk() if isinstance(s, omp.SingleOp)]
+                for single in singles:
+                    for block in single.region.blocks:
+                        _insert_taskwaits(block, dependences, False)
+                PatternRewriteWalker(
+                    ConvertParallelToTasks(pattern.chunk, dependences),
+                    apply_recursively=False,
+                ).rewrite_region(func_op.body)
 
         PatternRewriteWalker(pattern, apply_recursively=False).rewrite_module(op)
