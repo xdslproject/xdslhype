@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 
 from xdsl.builder import ImplicitBuilder
 from xdsl.context import Context
@@ -104,6 +105,47 @@ def _wrap_in_single_region(block: Block) -> bool:
     return True
 
 
+def _take_body(loop: scf.ParallelOp, rewriter: PatternRewriter) -> Block:
+    """
+    Detach the body of `loop`, with its index-typed induction variables as
+    block arguments and without the `scf.reduce` terminator.
+
+    Stack allocations are bounded to a single iteration with
+    `memref.alloca_scope`, matching MLIR's convert-scf-to-openmp.
+    """
+    region = loop.detach_region(loop.body)
+    body = region.detach_block(region.block)
+    terminator = body.last_op
+    assert isinstance(terminator, scf.ReduceOp)
+    rewriter.erase(terminator)
+    if _contains_alloca(body):
+        scope_block = Block()
+        for op in list(body.ops):
+            op.detach()
+            scope_block.add_op(op)
+        scope_block.add_op(memref.AllocaScopeReturnOp(operands=[[]]))
+        body.add_op(
+            memref.AllocaScopeOp(result_types=[[]], regions=[Region(scope_block)])
+        )
+    return body
+
+
+def _replace_with_construct(
+    loop: scf.ParallelOp, construct: Operation, rewriter: PatternRewriter
+) -> None:
+    """
+    Replace `loop` with `construct`, wrapped in `omp.parallel { omp.single { } }`
+    unless the loop already sits inside an `omp.single` region.
+    """
+    if _is_in_single_region(loop):
+        rewriter.replace(loop, construct)
+        return
+
+    parallel, single = _empty_parallel_region()
+    single.region.block.add_ops([construct, omp.TerminatorOp()])
+    rewriter.replace(loop, parallel)
+
+
 @dataclass
 class ConvertParallelToTaskloop(RewritePattern):
     """
@@ -158,84 +200,204 @@ class ConvertParallelToTaskloop(RewritePattern):
                     arith.ConstantOp.from_int_and_width(self.num_tasks, 64).result
                 ]
 
-        # Reuse the scf.parallel body block (index-typed induction variables) as
-        # the loop_nest body, swapping the scf.reduce terminator for omp.yield.
-        body = loop.detach_region(loop.body)
-        terminator = body.block.last_op
-        assert isinstance(terminator, scf.ReduceOp)
-        rewriter.erase(terminator)
-        if _contains_alloca(body.block):
-            # Match MLIR's convert-scf-to-openmp: bound stack allocations to a
-            # single iteration.
-            scope_block = Block()
-            for op in list(body.block.ops):
-                op.detach()
-                scope_block.add_op(op)
-            scope_block.add_op(memref.AllocaScopeReturnOp(operands=[[]]))
-            body.block.add_op(
-                memref.AllocaScopeOp(result_types=[[]], regions=[Region(scope_block)])
-            )
-        body.block.add_op(omp.YieldOp())
-
+        body = _take_body(loop, rewriter)
+        body.add_op(omp.YieldOp())
         loop_nest = omp.LoopNestOp(
             operands=[loop.lowerBound, inclusive_upper_bounds, loop.step],
             properties={"loop_inclusive": builtin.UnitAttr()},
-            regions=[body],
+            regions=[Region(body)],
         )
         taskloop = omp.TaskloopOp(
             operands=[[], [], [], grainsize, [], [], num_tasks, [], [], []],
             regions=[Region(Block([loop_nest]))],
         )
-        if _is_in_single_region(loop):
-            rewriter.replace(loop, taskloop)
+        _replace_with_construct(loop, taskloop, rewriter)
+
+
+@dataclass
+class ConvertParallelToTasks(RewritePattern):
+    """
+    Rewrites an outermost `scf.parallel` into explicit tasks, one per `chunk`
+    iterations of the outermost dimension:
+
+        omp.parallel {
+          omp.single {
+            omp.taskgroup {
+              scf.for %p = %lb0 to %ub0 step %step0 * chunk {
+                omp.task {
+                  scf.for %i0 = %p to min(%p + %step0 * chunk, %ub0) step %step0 {
+                    scf.for %i1 = %lb1 to %ub1 step %step1 {
+                      ... <body>
+                    }
+                  }
+                  omp.terminator
+                }
+              }
+              omp.terminator
+            }
+            omp.terminator
+          }
+          omp.terminator
+        }
+
+    With `chunk == 1` the `%i0` loop is omitted and `%p` is used directly. The
+    remaining dimensions run sequentially within each task, and the taskgroup
+    waits for all tasks before execution continues past the construct.
+
+    A loop that is already inside an `omp.single` region (see the pass's
+    `single_region` option) becomes just the `omp.taskgroup`.
+    """
+
+    chunk: int
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, loop: scf.ParallelOp, rewriter: PatternRewriter, /):
+        if not _is_convertible(loop):
+            # Reductions and nested parallel loops are not supported
             return
 
-        parallel, single = _empty_parallel_region()
-        single.region.block.add_ops([taskloop, omp.TerminatorOp()])
-        rewriter.replace(loop, parallel)
+        lb0, ub0, step0 = loop.lowerBound[0], loop.upperBound[0], loop.step[0]
+        with ImplicitBuilder(rewriter):
+            if self.chunk == 1:
+                task_step = step0
+            else:
+                chunk = arith.ConstantOp(
+                    builtin.IntegerAttr.from_index_int_value(self.chunk)
+                )
+                task_step = arith.MuliOp(step0, chunk).result
+
+        body = _take_body(loop, rewriter)
+        induction_vars = list(body.args)
+
+        task_block = Block()
+        task_start_block = Block(arg_types=[builtin.IndexType()])
+        task_start = task_start_block.args[0]
+
+        # (lower bound, upper bound, step, induction variable) of each
+        # sequential loop inside the task.
+        sequential: list[tuple[SSAValue, SSAValue, SSAValue, SSAValue]] = []
+        if self.chunk == 1:
+            induction_vars[0].replace_all_uses_with(task_start)
+        else:
+            with ImplicitBuilder(task_block):
+                chunk_end = arith.AddiOp(task_start, task_step)
+                task_end = arith.MinSIOp(chunk_end, ub0).result
+            sequential.append((task_start, task_end, step0, induction_vars[0]))
+        sequential.extend(
+            zip(
+                loop.lowerBound[1:],
+                loop.upperBound[1:],
+                loop.step[1:],
+                induction_vars[1:],
+                strict=True,
+            )
+        )
+
+        innermost = task_block
+        for lb, ub, step, induction_var in sequential:
+            for_body = Block(arg_types=[builtin.IndexType()])
+            innermost.add_op(scf.ForOp(lb, ub, step, [], for_body))
+            if innermost is not task_block:
+                innermost.add_op(scf.YieldOp())
+            induction_var.replace_all_uses_with(for_body.args[0])
+            innermost = for_body
+
+        for op in list(body.ops):
+            op.detach()
+            innermost.add_op(op)
+        if innermost is not task_block:
+            innermost.add_op(scf.YieldOp())
+        task_block.add_op(omp.TerminatorOp())
+
+        task = omp.TaskOp(
+            operands=[[], [], [], [], [], [], [], [], []],
+            regions=[Region(task_block)],
+        )
+        task_start_block.add_ops([task, scf.YieldOp()])
+        taskgroup = omp.TaskgroupOp(
+            operands=[[], [], []],
+            regions=[
+                Region(
+                    Block(
+                        [
+                            scf.ForOp(lb0, ub0, task_step, [], task_start_block),
+                            omp.TerminatorOp(),
+                        ]
+                    )
+                )
+            ],
+        )
+        _replace_with_construct(loop, taskgroup, rewriter)
 
 
 @dataclass(frozen=True)
 class ConvertScfToOmpTasks(ModulePass):
     """
-    Lowers outermost `scf.parallel` loops to OpenMP tasks.
-
-    Each loop becomes an `omp.taskloop` created by a single thread
-    (`omp.parallel { omp.single { ... } }`), with every loop dimension collapsed
-    into the taskloop's `omp.loop_nest`. Loops with reductions, and loops nested
-    inside another parallel construct, are left untouched.
+    Lowers outermost `scf.parallel` loops to OpenMP tasks, created by a single
+    thread (`omp.parallel { omp.single { ... } }`). Loops with reductions, and
+    loops nested inside another parallel construct, are left untouched.
 
     Arguments (all optional):
 
-    - grainsize: int: minimum number of loop iterations assigned to each task.
-    - num_tasks: int: number of tasks to create for each loop. Mutually
-    exclusive with grainsize. If neither is given the OpenMP runtime chooses how
-    to divide iterations.
+    - mode: {"taskloop", "task"}: how loops become tasks.
+      - "taskloop" (default): each loop becomes an `omp.taskloop`, with every
+      loop dimension collapsed into its `omp.loop_nest`.
+      - "task": each loop becomes an `omp.taskgroup` containing one explicit
+      `omp.task` per `chunk` iterations of the outermost dimension; the other
+      dimensions run sequentially inside each task.
+    - grainsize: int: (taskloop mode) minimum number of loop iterations assigned
+    to each task.
+    - num_tasks: int: (taskloop mode) number of tasks to create for each loop.
+    Mutually exclusive with grainsize. If neither is given the OpenMP runtime
+    chooses how to divide iterations.
+    - chunk: int: (task mode) iterations of the outermost dimension per task,
+    default 1.
     - single_region: bool: instead of one parallel region per loop, create a
     single `omp.parallel { omp.single { ... } }` per function, spanning from the
     first to the last op that contains a converted loop, so the thread team is
     forked once. The code between loops then runs on the single thread, and the
-    implicit taskgroup of each taskloop still orders the loops. The span is
-    extended over later ops that use values defined in it; if that would
+    tasks of each loop still complete before execution continues past it. The
+    span is extended over later ops that use values defined in it; if that would
     include the function's terminator, the function falls back to one region
     per loop.
     """
 
     name = "convert-scf-to-omp-tasks"
 
+    mode: Literal["taskloop", "task"] = "taskloop"
     grainsize: int | None = None
     num_tasks: int | None = None
+    chunk: int | None = None
     single_region: bool = False
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
-        if self.grainsize is not None and self.num_tasks is not None:
-            raise PassFailedException("grainsize and num_tasks are mutually exclusive")
         for value, option in (
             (self.grainsize, "grainsize"),
             (self.num_tasks, "num_tasks"),
+            (self.chunk, "chunk"),
         ):
             if value is not None and value <= 0:
                 raise PassFailedException(f"{option} must be positive")
+
+        pattern: RewritePattern
+        if self.mode == "taskloop":
+            if self.grainsize is not None and self.num_tasks is not None:
+                raise PassFailedException(
+                    "grainsize and num_tasks are mutually exclusive"
+                )
+            if self.chunk is not None:
+                raise PassFailedException("chunk is only supported in task mode")
+            pattern = ConvertParallelToTaskloop(self.grainsize, self.num_tasks)
+        elif self.mode == "task":
+            if self.grainsize is not None or self.num_tasks is not None:
+                raise PassFailedException(
+                    "grainsize and num_tasks are only supported in taskloop mode"
+                )
+            pattern = ConvertParallelToTasks(1 if self.chunk is None else self.chunk)
+        else:
+            raise PassFailedException(
+                f"unknown mode {self.mode!r}, expected 'taskloop' or 'task'"
+            )
 
         if self.single_region:
             funcs = [f for f in op.walk() if isinstance(f, func.FuncOp)]
@@ -243,7 +405,4 @@ class ConvertScfToOmpTasks(ModulePass):
                 for block in func_op.body.blocks:
                     _wrap_in_single_region(block)
 
-        PatternRewriteWalker(
-            ConvertParallelToTaskloop(self.grainsize, self.num_tasks),
-            apply_recursively=False,
-        ).rewrite_module(op)
+        PatternRewriteWalker(pattern, apply_recursively=False).rewrite_module(op)
