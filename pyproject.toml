@@ -20,7 +20,7 @@ classifiers = [
 ]
 dynamic = [ "version" ]
 dependencies = [
-  "xdsl~=0.70.0",
+  "xdsl",
 ]
 urls."Issue Tracker" = "https://github.com/xdslproject/xdslhype/issues"
 urls."Source Code" = "https://github.com/xdslproject/xdslhype"
