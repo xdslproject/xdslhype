@@ -6,6 +6,7 @@ from .imperfect_nested_loops_to_perfect import ImperfectNestedLoopsToPerfect
 from .nested_parallel_ops_to_multidimensional import NestedParallelOpsToMultidimensional
 from .reuse_memory_allocations import ResuseMemoryAllocations
 from .strip_visibility_property import StripVisibilityProperty
+from .convert_scf_to_omp_tasks import ConvertScfToOmpTasks
 
 def get_transform_parallel_ops_to_for_pass():
     return NestedParallelOpsToForOps
@@ -22,6 +23,9 @@ def get_reuse_memory_allocations_pass():
 def get_strip_visibility_property_pass():
     return StripVisibilityProperty
 
+def get_convert_scf_to_omp_tasks_pass():
+    return ConvertScfToOmpTasks
+
 def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
     """Return the list of all available passes."""
 
@@ -31,5 +35,6 @@ def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
         "imperfect-nested-loops-to-perfect": get_imperfect_nested_loops_to_perfect_pass,
         "nested-parallel-ops-to-multidimensional": get_nested_parallel_ops_to_multidimensional_pass,
         "strip-visibility-property": get_strip_visibility_property_pass,
-        "reuse-memory-allocations": get_reuse_memory_allocations_pass
+        "reuse-memory-allocations": get_reuse_memory_allocations_pass,
+        "convert-scf-to-omp-tasks": get_convert_scf_to_omp_tasks_pass,
     }
