@@ -13,6 +13,7 @@ from xdsl.builder import Builder
 from dataclasses import dataclass
 from xdsl.ir import Operation, SSAValue, BlockArgument
 from queue import Queue
+
 def determine_max_live_memrefs(op: builtin.ModuleOp):
     live_memrefs = set()
     allocated_memrefs = set()
@@ -79,29 +80,6 @@ def create_cloned_dependency_ops(val: SSAValue):
             value_mapper[old_res] = new_res
 
     return cloned_ops
-
-class RemoveOldAllocationsAndDeallocations(RewritePattern):
-    def __init__(self, num_allocations_to_keep: int):
-        self.for_count = 0
-        self.allocation_count = 0
-        self.num_allocations_to_keep = num_allocations_to_keep
-
-    @op_type_rewrite_pattern
-    def match_and_rewrite(self, op: Operation, rewriter: PatternRewriter):
-        #if isinstance(op, memref.AllocOp) and not isinstance(op.parent.parent.parent, scf.ForOp):
-        #    self.allocation_count = self.allocation_count + 1
-        #    if self.allocation_count > self.num_allocations_to_keep:
-        #        rewriter.erase(op, safe_erase=False)
-        if isinstance(op, scf.ForOp):
-            print (self.for_count)
-            self.for_count = self.for_count + 1
-            print (self.for_count)
-            if self.for_count > self.num_allocations_to_keep:
-                print(op)
-                print (self.num_allocations_to_keep)
-                #rewriter.erase(op, safe_erase=False)
-        if isinstance(op, memref.DeallocOp):
-            rewriter.erase(op, safe_erase=False)
 
 @dataclass(frozen=True)
 class ResuseMemoryAllocations(ModulePass):
