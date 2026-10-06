@@ -1,4 +1,4 @@
-// RUN: xdsl-opt -p scf-parallel-loop-fusion --split-input-file %s | filecheck %s
+// RUN: xdsl-opt -p "scf-parallel-loop-fusion{combine_inner=false}" --split-input-file %s | filecheck %s
 
 // Nests of equal depth: the outer loops are fused, the innermost loops stay
 // separate. Bounds defined inside the loops are compared structurally, and the

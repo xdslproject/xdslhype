@@ -37,10 +37,16 @@ and, through a pointer argument `p` computed from memref M, to read and write
 only the cell `[p, p + s)`, where `s` is the distance between the pointers of
 consecutive iterations (the coefficient of the innermost fused induction
 variable in the address of `p`).
+
+With `combine_inner`, a second phase then fuses adjacent innermost loops (with no
+nested `scf.parallel`) inside another `scf.parallel`, such as the siblings left
+by the first phase: if they have equivalent bounds and pass the same check, the
+second loop's body is appended to the first's. Side-effect free ops between the
+two loops (typically the second loop's bounds) are moved before the first.
 """
 
 from collections import Counter
-from collections.abc import Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import cast
 
@@ -661,6 +667,60 @@ def _try_fuse(a: scf.ParallelOp, b: scf.ParallelOp, cell_local: set[str]) -> boo
     return True
 
 
+def _next_inner(loop: scf.ParallelOp) -> tuple[list[Operation], scf.ParallelOp] | None:
+    """
+    The side-effect free ops between `loop` and the next `scf.parallel` in its
+    block, and that loop, if there is one.
+    """
+    between: list[Operation] = []
+    op = loop.next_op
+    while op is not None and not isinstance(op, scf.ParallelOp):
+        if op.regions or not _is_pure(op):
+            return None
+        between.append(op)
+        op = op.next_op
+    if op is None:
+        return None
+    return between, op
+
+
+def _try_combine_inner(a: scf.ParallelOp, cell_local: set[str]) -> bool:
+    """Fuse `a` with the next innermost loop in its block, if legal."""
+    if _nested_parallels(a) or not isinstance(a.parent_op(), scf.ParallelOp):
+        return False
+    following = _next_inner(a)
+    if following is None:
+        return False
+    between, b = following
+    if (
+        _nested_parallels(b)
+        or a.initVals
+        or b.initVals
+        or len(a.lowerBound) != len(b.lowerBound)
+    ):
+        return False
+    levels = [(a, b)]
+    try:
+        _check(a, b, levels, cell_local)
+    except _Illegal:
+        return False
+    for op in between:
+        op.detach()
+        Rewriter.insert_op(op, InsertPoint.before(a))
+    _fuse(levels)
+    return True
+
+
+def _fuse_to_fixpoint(module: builtin.ModuleOp, fuse: Callable[[scf.ParallelOp], bool]) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for loop in module.walk():
+            if isinstance(loop, scf.ParallelOp) and fuse(loop):
+                changed = True
+                break
+
+
 @dataclass(frozen=True)
 class ScfParallelLoopFusion(ModulePass):
     """
@@ -677,23 +737,23 @@ class ScfParallelLoopFusion(ModulePass):
     cell of the iteration making the call: up to the pointer passed by the
     next iteration of the innermost fused loop. Calls to other functions prevent
     fusion.
+    - combine_inner: bool: after fusing the outer loops, also fuse adjacent
+    innermost loops inside an `scf.parallel` into one, appending the second
+    loop's body to the first's. Default true; false keeps the innermost loops
+    separate.
     """
 
     name = "scf-parallel-loop-fusion"
 
     cell_local_callees: tuple[str, ...] = ()
+    combine_inner: bool = True
 
     def apply(self, ctx: Context, op: builtin.ModuleOp) -> None:
         cell_local = set(self.cell_local_callees)
-        changed = True
-        while changed:
-            changed = False
-            for loop in op.walk():
-                if not isinstance(loop, scf.ParallelOp):
-                    continue
-                following = loop.next_op
-                if isinstance(following, scf.ParallelOp) and _try_fuse(
-                    loop, following, cell_local
-                ):
-                    changed = True
-                    break
+        _fuse_to_fixpoint(
+            op,
+            lambda loop: isinstance(loop.next_op, scf.ParallelOp)
+            and _try_fuse(loop, loop.next_op, cell_local),
+        )
+        if self.combine_inner:
+            _fuse_to_fixpoint(op, lambda loop: _try_combine_inner(loop, cell_local))
