@@ -5,6 +5,7 @@ from .nested_parallel_ops_to_for_ops import NestedParallelOpsToForOps
 from .imperfect_nested_loops_to_perfect import ImperfectNestedLoopsToPerfect
 from .nested_parallel_ops_to_multidimensional import NestedParallelOpsToMultidimensional
 from .reuse_memory_allocations import ResuseMemoryAllocations
+from .fuse_memory_allocations import FuseMemoryAllocations
 from .strip_visibility_property import StripVisibilityProperty
 from .convert_scf_to_omp_tasks import ConvertScfToOmpTasks
 from .scf_parallel_loop_fusion import ScfParallelLoopFusion
@@ -20,6 +21,9 @@ def get_nested_parallel_ops_to_multidimensional_pass():
 
 def get_reuse_memory_allocations_pass():
     return ResuseMemoryAllocations
+
+def get_fuse_memory_allocations_pass():
+    return FuseMemoryAllocations
 
 def get_strip_visibility_property_pass():
     return StripVisibilityProperty
@@ -40,6 +44,7 @@ def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
         "nested-parallel-ops-to-multidimensional": get_nested_parallel_ops_to_multidimensional_pass,
         "strip-visibility-property": get_strip_visibility_property_pass,
         "reuse-memory-allocations": get_reuse_memory_allocations_pass,
+        "fuse-memory-allocations": get_fuse_memory_allocations_pass,
         "convert-scf-to-omp-tasks": get_convert_scf_to_omp_tasks_pass,
         "scf-parallel-loop-fusion": get_scf_parallel_loop_fusion_pass,
     }
