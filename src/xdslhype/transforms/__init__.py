@@ -8,6 +8,7 @@ from .reuse_memory_allocations import ResuseMemoryAllocations
 from .fuse_memory_allocations import FuseMemoryAllocations
 from .strip_visibility_property import StripVisibilityProperty
 from .convert_scf_to_omp_tasks import ConvertScfToOmpTasks
+from .scf_parallel_loop_fusion import ScfParallelLoopFusion
 
 def get_transform_parallel_ops_to_for_pass():
     return NestedParallelOpsToForOps
@@ -30,6 +31,9 @@ def get_strip_visibility_property_pass():
 def get_convert_scf_to_omp_tasks_pass():
     return ConvertScfToOmpTasks
 
+def get_scf_parallel_loop_fusion_pass():
+    return ScfParallelLoopFusion
+
 def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
     """Return the list of all available passes."""
 
@@ -42,4 +46,5 @@ def get_all_passes() -> dict[str, Callable[[], type[ModulePass]]]:
         "reuse-memory-allocations": get_reuse_memory_allocations_pass,
         "fuse-memory-allocations": get_fuse_memory_allocations_pass,
         "convert-scf-to-omp-tasks": get_convert_scf_to_omp_tasks_pass,
+        "scf-parallel-loop-fusion": get_scf_parallel_loop_fusion_pass,
     }
